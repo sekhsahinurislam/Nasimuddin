@@ -46,7 +46,8 @@ main{width:min(980px,calc(100% - 28px));margin:34px auto 60px}.top{display:flex;
       </div>
     </div>
     <div class="actions">
-      <button class="btn" id="uploadBtn" disabled>Compress & Upload</button>
+      <button class="btn secondary" id="compressBtn" disabled>Compress</button>
+      <button class="btn" id="uploadBtn" disabled>Upload to Cloudinary</button>
       <button class="btn secondary" id="clearBtn" type="button">সব মুছুন</button>
       <span class="muted" id="selectionInfo">কোনো ছবি নির্বাচন করা হয়নি</span>
     </div>
@@ -79,7 +80,11 @@ main{width:min(980px,calc(100% - 28px));margin:34px auto 60px}.top{display:flex;
   drop.addEventListener("drop", e => addFiles([...e.dataTransfer.files]));
   $("quality").addEventListener("input", e => $("qualityValue").textContent = e.target.value + "%");
   $("clearBtn").addEventListener("click", () => { queue.forEach(x => x.preview && URL.revokeObjectURL(x.preview)); queue = []; render(); });
+  $("compressBtn").addEventListener("click", compressAll);
   $("uploadBtn").addEventListener("click", uploadAll);
+  ["format","width","quality"].forEach(id => $(id).addEventListener("change", invalidateCompressed));
+  $("width").addEventListener("input", invalidateCompressed);
+  $("quality").addEventListener("input", invalidateCompressed);
 
   function addFiles(files) {
     const accepted = files.filter(f => ["image/jpeg","image/png","image/webp","image/gif"].includes(f.type));
@@ -97,7 +102,8 @@ main{width:min(980px,calc(100% - 28px));margin:34px auto 60px}.top{display:flex;
   function render() {
     $("count").textContent = queue.length + "টি";
     $("selectionInfo").textContent = queue.length ? `${queue.length}টি ছবি নির্বাচন করা হয়েছে` : "কোনো ছবি নির্বাচন করা হয়নি";
-    $("uploadBtn").disabled = !queue.some(x => x.state === "Ready" || x.state === "Error");
+    $("compressBtn").disabled = !queue.some(x => !x.url && !x.compressedBlob && ["Ready","Error"].includes(x.state));
+    $("uploadBtn").disabled = !queue.some(x => !x.url && ["Ready","Compressed","Error"].includes(x.state));
     if (!queue.length) { itemsEl.innerHTML = '<div class="empty">এখনও কোনো ছবি যোগ করা হয়নি।</div>'; return; }
     itemsEl.innerHTML = "";
     queue.forEach((item, index) => {
@@ -105,7 +111,7 @@ main{width:min(980px,calc(100% - 28px));margin:34px auto 60px}.top{display:flex;
       const img = document.createElement("img"); img.className = "thumb"; img.src = item.preview; img.alt = "";
       const info = document.createElement("div"); info.className = "info";
       const name = document.createElement("div"); name.className = "name"; name.textContent = item.file.name;
-      const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = `${formatBytes(item.file.size)}${item.outputSize ? " → " + formatBytes(item.outputSize) : ""}`;
+      const meta = document.createElement("div"); meta.className = "meta"; meta.textContent = `${formatBytes(item.file.size)}${item.outputSize ? " → " + formatBytes(item.outputSize) : ""}${item.dimensions ? " · " + item.dimensions : ""}`;
       const bar = document.createElement("div"); bar.className = "bar";
       const fill = document.createElement("span"); fill.style.width = item.progress + "%"; bar.append(fill);
       const status = document.createElement("div"); status.className = "status " + (item.state === "Uploaded" ? "ok" : item.state === "Error" ? "err" : "");
@@ -162,28 +168,53 @@ main{width:min(980px,calc(100% - 28px));margin:34px auto 60px}.top{display:flex;
       xhr.send(data);
     });
   }
-  async function uploadAll() {
-    const btn = $("uploadBtn"); btn.disabled = true; btn.textContent = "Uploading...";
+  function invalidateCompressed() {
+    // If the user changes compression options, require a fresh manual Compress action.
+    queue.forEach(item => {
+      if (!item.url && item.compressedBlob) {
+        item.compressedBlob = null; item.outputSize = null; item.dimensions = ""; item.state = "Ready";
+      }
+    });
+    render();
+  }
+  async function compressAll() {
+    const btn = $("compressBtn"); btn.disabled = true; btn.textContent = "Compressing...";
     const mime = $("format").value;
     const maxWidth = Math.max(100, Math.min(8000, Number($("width").value) || 1920));
     const quality = Number($("quality").value) / 100;
     for (const item of queue) {
-      if (!["Ready","Error"].includes(item.state)) continue;
-      item.state = "Compressing"; item.error = ""; item.progress = 0; render();
+      if (item.url || item.compressedBlob) continue;
+      item.state = "Compressing"; item.error = ""; render();
       try {
         const {blob,w,h} = await canvasBlob(item.file,maxWidth,mime,quality);
-        item.outputSize = blob.size; item.dimensions = `${w}×${h}`;
-        item.state = "Uploading"; render();
-        const ext = mime === "image/jpeg" ? "jpg" : mime === "image/png" ? "png" : "webp";
-        const safeBase = item.file.name.replace(/\.[^.]+$/,"").replace(/[^\w.-]+/g,"-").slice(0,80) || "image";
-        const result = await xhrUpload(blob, `${safeBase}.${ext}`, p => { item.progress = p; render(); });
+        item.compressedBlob = blob; item.outputSize = blob.size; item.dimensions = `${w}×${h}`;
+        item.outputExtension = mime === "image/jpeg" ? "jpg" : mime === "image/png" ? "png" : "webp";
+        item.state = "Compressed";
+      } catch (err) { item.state = "Error"; item.error = err.message || "Compression failed"; }
+      render();
+    }
+    btn.textContent = "Compress"; render();
+  }
+  async function uploadAll() {
+    const btn = $("uploadBtn"); btn.disabled = true; btn.textContent = "Uploading...";
+    for (const item of queue) {
+      if (item.url || !["Ready","Compressed","Error"].includes(item.state)) continue;
+      item.error = ""; item.progress = 0; item.state = "Uploading"; render();
+      try {
+        // Upload the compressed output only if the user explicitly pressed Compress.
+        // Otherwise, upload the original file unchanged.
+        const blob = item.compressedBlob || item.file;
+        const isCompressed = Boolean(item.compressedBlob);
+        const safeBase = item.file.name.replace(/\.[^.]+$/," ").trim().replace(/[^\w.-]+/g,"-").slice(0,80) || "image";
+        const filename = isCompressed ? `${safeBase}.${item.outputExtension}` : item.file.name;
+        const result = await xhrUpload(blob, filename, p => { item.progress = p; render(); });
         item.url = result.secure_url;
-        item.state = "Uploaded"; item.progress = 100;
+        item.state = isCompressed ? "Uploaded (compressed)" : "Uploaded (original)";
+        item.progress = 100;
       } catch (err) { item.state = "Error"; item.error = err.message || "Upload failed"; }
       render();
     }
-    btn.textContent = "Compress & Upload";
-    btn.disabled = !queue.some(x => x.state === "Ready" || x.state === "Error");
+    btn.textContent = "Upload to Cloudinary"; render();
   }
   render();
 })();
